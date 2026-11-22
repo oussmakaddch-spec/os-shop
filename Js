@@ -1,0 +1,41 @@
+// طلبات سحب الأرباح (للبائع) + معالجتها يدويًا (للمدير). الرصيد يُحسب داخل قاعدة البيانات.
+const { sb, userFrom } = require("./_admin");
+const J = (s, o) => ({ statusCode: s, body: JSON.stringify(o) });
+const MIN = 1000;
+const ACC = { baridimob: /^\d{20}$/, ccp: /^\d{10,12}$/ }; // RIP بريدي موب / حساب CCP (الذهبية)
+
+exports.handler = async (event) => {
+  if (event.httpMethod !== "POST") return J(405, { error: "method" });
+  try {
+    let u;
+    try { u = await userFrom(event); } catch { return J(401, { error: "auth" }); }
+    const b = JSON.parse(event.body || "{}");
+    const isAdmin = !!process.env.ADMIN_EMAIL && u.email === process.env.ADMIN_EMAIL && !!u.email_confirmed_at;
+
+    if (b.action === "request") {
+      const amount = Math.round(Number(b.amount)), method = String(b.method), account = String(b.account || "").replace(/\s/g, "");
+      const holder = String(b.holder || "").trim();
+      if (!(amount >= MIN)) return J(400, { error: "min" });
+      if (!ACC[method] || !ACC[method].test(account)) return J(400, { error: "account" });
+      if (holder.length < 3 || holder.length > 60) return J(400, { error: "holder" });
+      const name = (u.user_metadata && (u.user_metadata.full_name || u.user_metadata.name)) || "";
+      const { data, error } = await sb.rpc("create_payout", { p_seller: u.id, p_amount: amount, p_method: method, p_account: account, p_holder: holder, p_name: name, p_email: u.email || "" });
+      if (error) { console.error(error.message); return J(500, { error: "server" }); }
+      return data ? J(200, { ok: true }) : J(400, { error: "amount" });
+    }
+
+    if (!isAdmin) return J(403, { error: "forbidden" });
+    if (b.action === "list") {
+      const { data } = await sb.from("payouts").select("*").eq("status", "pending").order("created_at");
+      return J(200, { items: (data || []).map((p) => ({ id: p.id, amount: p.amount, method: p.method, account: p.account, holder: p.holder, sellerName: p.seller_name, sellerEmail: p.seller_email })) });
+    }
+    if (b.action === "mark" && ["paid", "rejected"].includes(b.status)) {
+      const { data } = await sb.from("payouts").update({ status: b.status, processed_at: new Date().toISOString() }).eq("id", String(b.id)).eq("status", "pending").select("id");
+      return data && data.length ? J(200, { ok: true }) : J(400, { error: "state" });
+    }
+    return J(400, { error: "invalid" });
+  } catch (e) {
+    console.error("payout", e && e.message);
+    return J(500, { error: "server" });
+  }
+};
